@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Cible le SDK Windows pour accéder aux voix neuronales "Natural" (WinRT) -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>ClaudeVocal</AssemblyName>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Mot-clé + synthèse vocale de repli -->
+    <PackageReference Include="System.Speech" Version="8.0.0" />
+    <!-- Capture micro -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <!-- Transcription locale Whisper (GPU CUDA + repli CPU) -->
+    <PackageReference Include="Whisper.net" Version="1.8.1" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.8.1" />
+    <PackageReference Include="Whisper.net.Runtime.Cuda" Version="1.8.1" />
+  </ItemGroup>
+
+</Project>
