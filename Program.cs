@@ -27,9 +27,63 @@ class Program
     static readonly object _verrou = new();
     static volatile bool _enTrainDeParler;          // pour ne pas s'auto-écouter pendant le TTS
     static readonly Stopwatch _depuisBascule = Stopwatch.StartNew();
+    static volatile bool _occupe;                   // true = Claude travaille (pastille rouge)
+
+    // Identité de CETTE instance (plusieurs poulpes possibles, un par agent).
+    static string _nom = "claude";                  // mot-clé de réveil de cet agent
+    static int _index;                              // position à l'écran / identifiant
+    static string _dossierMemoire = "";             // dossier mémoire propre à CE profil
+    public static string Nom => _nom;
+    public static int Index => _index;
+
+    // Dossier de mémoire persistante propre au profil (Claude, Jarvis, ...), pour
+    // garder un flux de travail continu d'une session à l'autre. Stable entre les
+    // recompilations (rangé sous le profil utilisateur, pas dans le dossier de build).
+    static string DossierMemoire()
+    {
+        var dossier = Path.Combine(Salon.Racine, "profils", _nom);
+        try { Directory.CreateDirectory(dossier); } catch { }
+        return dossier;
+    }
+
+    // Publie l'état courant de cet agent dans le registre partagé (voir Salon),
+    // pour que les autres poulpes (et leur LLM) sachent ce qu'on fait.
+    static void PublierEtat(string etat)
+    {
+        var tache = _taches.FirstOrDefault(x => x.statut == "in_progress").contenu ?? "";
+        Salon.Publier(_nom, _index, etat, tache);
+    }
+
+    // À chaque nouveau tour, la 1re phrase parlée est préfixée du nom de l'agent
+    // (« Claude. … ») pour distinguer qui parle quand plusieurs poulpes se répondent.
+    // Les phrases suivantes du même tour ne le sont pas.
+    static volatile bool _debutTour;
+
+    static string Prefixer(string phrase)
+    {
+        if (!_debutTour) return phrase;
+        _debutTour = false;
+        string nomAffiche = char.ToUpper(_nom[0]) + _nom[1..];
+        return $"{nomAffiche}. {phrase}";
+    }
 
     static Process? _claude;                          // le process claude persistant
     static string _dernierDit = "";                   // dernière phrase déjà lue (anti-doublon)
+
+    // Historique des échanges (toi + Claude), pour la commande « historique N ».
+    static readonly List<(string qui, string texte)> _historique = new();
+    static readonly object _histVerrou = new();
+
+    static void NoterHistorique(string qui, string texte)
+    {
+        texte = texte?.Trim() ?? "";
+        if (texte.Length == 0) return;
+        lock (_histVerrou)
+        {
+            _historique.Add((qui, texte));
+            if (_historique.Count > 200) _historique.RemoveAt(0);   // borne mémoire
+        }
+    }
 
     // Consigne « conversation orale », envoyée avec chaque question.
     const string Consigne =
@@ -47,8 +101,18 @@ class Program
     [STAThread]
     static void Main(string[] args)
     {
-        Console.OutputEncoding = Encoding.UTF8;
-        Console.WriteLine("=== Claude Vocal ===");
+        // Nom (= mot-clé de réveil) et position de cet agent, passés par l'instance
+        // parente quand on clique « + » ou qu'on dit « nouvel agent ».
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i] == "--nom") _nom = args[i + 1].Trim().ToLowerInvariant();
+            else if (args[i] == "--index" && int.TryParse(args[i + 1], out var ix)) _index = ix;
+        }
+
+        _dossierMemoire = DossierMemoire();             // mémoire persistante de CE profil
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Salon.Retirer();   // sortie propre du registre
+
+        try { Console.OutputEncoding = Encoding.UTF8; } catch { /* pas de console (WinExe) */ }
         // Avalonia prend le thread principal ; le vocal démarre quand l'UI est prête.
         BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
@@ -63,6 +127,8 @@ class Program
     {
         if (!LancerClaude())
             return;
+
+        PublierEtat("repos");                            // on s'inscrit au registre partagé
 
         if (!await Transcripteur.Init())
         {
@@ -83,7 +149,7 @@ class Program
         // Deux grammaires : le mot-clé « claude » (bascule) et « annule » (abandon).
         // La dictée elle-même passe par Whisper (streaming).
         var cult = reco.RecognizerInfo.Culture;
-        var motCle = new Grammar(new GrammarBuilder("claude") { Culture = cult }) { Name = "wake" };
+        var motCle = new Grammar(new GrammarBuilder(_nom) { Culture = cult }) { Name = "wake" };
         var annulerG = new Grammar(new GrammarBuilder(new Choices("annule", "annuler")) { Culture = cult })
         {
             Name = "cancel"
@@ -100,15 +166,33 @@ class Program
         }
 
         reco.RecognizeAsync(RecognizeMode.Multiple);
+        _reco = reco;                                  // évite le ramasse-miettes
 
-        await Tts.Parler("Bonjour. Dis Claude pour me parler.");
-        Console.WriteLine("En écoute du mot-clé « claude »...  (Entrée pour quitter)");
-        Console.ReadLine();
+        DemarrerRappelInactif();                        // rappels « je suis inactif » toutes les 30 s
 
-        reco.RecognizeAsyncStop();
-        _arretDemande = true;
-        try { _claude?.StandardInput.Close(); _claude?.Kill(true); } catch { }
-        Environment.Exit(0);
+        await BriefingDemarrage();                       // Claude apprend qu'il parle en vocal + se présente
+
+        // Plus de console : la fenêtre du poulpe gère la durée de vie de l'appli.
+        await Task.Delay(System.Threading.Timeout.Infinite);
+    }
+
+    static SpeechRecognitionEngine? _reco;             // gardé en vie tant que l'appli tourne
+
+    // Rappel vocal périodique quand l'agent est inactif (pastille verte) : il dit
+    // son nom pour signaler qu'il ne fait rien, sans couper une dictée en cours.
+    static void DemarrerRappelInactif()
+    {
+        _ = Task.Run(async () =>
+        {
+            while (!_arretDemande)
+            {
+                try { await Task.Delay(30000); } catch { break; }
+                if (_occupe || _enTrainDeParler) continue;          // occupé ou déjà en train de parler
+                if (Salon.OccupeAilleurs()) continue;               // un autre agent est en conversation
+                if (_etat == Etat.Ecoute && Micro.AParle) continue; // tu es en train de dicter
+                try { await Tts.Parler($"Agent {_nom}, inactif."); } catch { }
+            }
+        });
     }
 
     // ── Lancement du process claude persistant (streaming JSON) ───────────────
@@ -122,7 +206,8 @@ class Program
                 // Mode programmatique : reste vivant, lit du JSON, écrit du JSON.
                 // --dangerously-skip-permissions : agit sans demander (obligatoire en vocal).
                 Arguments = "/c claude -p --input-format stream-json --output-format stream-json " +
-                            "--verbose --dangerously-skip-permissions",
+                            "--verbose --dangerously-skip-permissions " +
+                            $"--add-dir \"{Salon.Racine}\"",   // accès à sa mémoire + au registre des agents
                 RedirectStandardInput = true,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -189,7 +274,24 @@ class Program
                             _dernierDit = phrase;
                             Console.WriteLine("\nClaude : " + phrase + "\n");
                             Overlay.Claude(phrase);
-                            await Tts.ParlerProtege(phrase);
+                            NoterHistorique("Claude", phrase);
+                            await Tts.ParlerProtege(Prefixer(phrase));
+                        }
+                        // Claude met à jour sa to-do list -> on l'affiche à droite du poulpe.
+                        else if (bloc.TryGetProperty("type", out var bt2) && bt2.GetString() == "tool_use" &&
+                                 bloc.TryGetProperty("name", out var bn) && bn.GetString() == "TodoWrite" &&
+                                 bloc.TryGetProperty("input", out var inp) &&
+                                 inp.TryGetProperty("todos", out var lt) && lt.ValueKind == JsonValueKind.Array)
+                        {
+                            var liste = new List<(string, string)>();
+                            foreach (var td in lt.EnumerateArray())
+                            {
+                                var c = td.TryGetProperty("content", out var cc) ? (cc.GetString() ?? "") : "";
+                                var st = td.TryGetProperty("status", out var ss) ? (ss.GetString() ?? "") : "";
+                                if (c.Trim().Length > 0) liste.Add((c.Trim(), st));
+                            }
+                            _taches = liste;
+                            Overlay.Todos(liste);
                         }
                     }
                     continue;
@@ -206,9 +308,11 @@ class Program
                     {
                         Console.WriteLine("\nClaude : " + reponse + "\n");
                         Overlay.Claude(reponse);
-                        await Tts.ParlerProtege(reponse);
+                        NoterHistorique("Claude", reponse);
+                        await Tts.ParlerProtege(Prefixer(reponse));
                     }
                     _dernierDit = "";
+                    _occupe = false;
                     Overlay.Travail(false);           // Claude attend ta réponse -> rond vert
                     Demarrer();                       // conversation continue : on réécoute
                 }
@@ -243,6 +347,40 @@ class Program
         });
     }
 
+    // ── Briefing one-shot au démarrage : Claude apprend le contexte vocal ─────
+    static async Task BriefingDemarrage()
+    {
+        if (_claude is null || _claude.HasExited) return;
+
+        string nomAffiche = char.ToUpper(_nom[0]) + _nom[1..];
+        string brief = Consigne + "\n\n" +
+            $"[DÉMARRAGE] Tu es « {nomAffiche} », un agent assistant avec qui on discute À LA VOIX, " +
+            "via un petit overlay en forme de poulpe posé sur l'écran. Ce n'est pas un terminal " +
+            "classique : chaque message que tu reçois vient d'une dictée vocale de l'utilisateur, et " +
+            "tes réponses sont lues à voix haute. Ne sois donc pas surpris par ce format conversationnel.\n\n" +
+            $"[MÉMOIRE] Ton dossier de mémoire personnel est : {_dossierMemoire}. Il n'est qu'à toi (profil " +
+            $"« {nomAffiche} »). Lis-y le fichier MEMOIRE.md s'il existe pour reprendre le fil de notre travail, " +
+            "puis tiens-le à jour au fil de l'eau (tâches en cours, décisions, prochaines étapes) afin de garder " +
+            "une continuité d'une session à l'autre.\n\n" +
+            $"[AGENTS] Tu n'es pas seul : chaque poulpe publie son état dans {Salon.DossierAgents} (un fichier " +
+            "JSON par agent : pid, nom, index, etat, tache). Pour connaître les autres agents et leur état, lis " +
+            "ce dossier. Pour en arrêter un, tue son pid. Pour en créer un, lance ClaudeVocal.exe avec l'argument " +
+            "--nom suivi du nom voulu.\n\n" +
+            "Pour finir : présente-toi en UNE seule phrase courte et dis que tu es prêt à l'aider.";
+
+        var msg = new { type = "user", message = new { role = "user", content = brief } };
+        _occupe = true;
+        _debutTour = true;
+        PublierEtat("travail");
+        Overlay.Travail(true);
+        try
+        {
+            await _claude.StandardInput.WriteLineAsync(JsonSerializer.Serialize(msg));
+            await _claude.StandardInput.FlushAsync();
+        }
+        catch { /* tant pis, on reste silencieux */ }
+    }
+
     // ── Injection d'une question dans le process claude ───────────────────────
     static async Task EnvoyerAClaude(string question)
     {
@@ -255,6 +393,10 @@ class Program
 
         Console.WriteLine("Vous : " + question);
         Overlay.Vous(question);
+        NoterHistorique("Vous", question);
+        _occupe = true;
+        _debutTour = true;                     // la 1re phrase parlée sera préfixée du nom
+        PublierEtat("travail");
         Overlay.Travail(true);                 // Claude se met au travail -> rond rouge
 
         // Message au format attendu par claude (stream-json input).
@@ -314,6 +456,7 @@ class Program
 
         // « claude » -> DÉMARRE seulement. L'arrêt se fait au silence (pas de coupure).
         if (enEcoute) return;
+        if (Salon.OccupeAilleurs()) return;            // un autre poulpe est déjà en conversation
         if (conf < ConfDemarrage) return;
         if (_depuisBascule.ElapsedMilliseconds < AntiRebondMs) return;
         _depuisBascule.Restart();
@@ -330,7 +473,9 @@ class Program
             DemarrerBoucle();
             Console.WriteLine("\n[●] Écoute... parle librement, fais une PAUSE pour envoyer (« annule » pour abandonner).");
         }
+        PublierEtat("ecoute");
         Overlay.Etat(true);
+        Overlay.Live("");                      // bulle bleue « en direct » -> tu parles
         Bip(true);
     }
 
@@ -362,6 +507,8 @@ class Program
 
         ArreterBoucle();
         Micro.Arreter();                               // on jette l'audio
+        PublierEtat("repos");                          // libère les autres agents
+        Overlay.FinLive();
         Console.WriteLine("\n[✕] Annulé.");
         Bip(false);
     }
@@ -378,6 +525,8 @@ class Program
 
         ArreterBoucle();
         Micro.Arreter();
+        PublierEtat("repos");                          // libère les autres agents
+        Overlay.FinLive();
         Overlay.Etat(false);
         Console.WriteLine("\n[zzz] En veille — dis « claude » pour reprendre.");
     }
@@ -417,11 +566,7 @@ class Program
                             {
                                 var t = Nettoyer(await Transcripteur.Transcrire(pcm));
                                 if (!ct.IsCancellationRequested && t.Length > 0)
-                                {
-                                    var largeur = Math.Max(20, (Console.WindowWidth > 8 ? Console.WindowWidth : 80) - 6);
-                                    var aff = t.Length > largeur ? "…" + t[^largeur..] : t;
-                                    Console.Write("\r   ✎ " + aff.PadRight(largeur));
-                                }
+                                    Overlay.Live(t);          // met à jour la bulle bleue en direct
                             }
                             finally { _liveEnCours = false; }
                         });
@@ -441,6 +586,8 @@ class Program
     static async Task TraiterTour()
     {
         ArreterBoucle();
+        PublierEtat("travail");                // on ne dicte plus : on traite
+        Overlay.FinLive();                     // la bulle finale « Vous » prend le relais
         Console.WriteLine("\n[■] Transcription...");
 
         var pcm = Micro.Arreter();
@@ -449,6 +596,64 @@ class Program
         if (string.IsNullOrWhiteSpace(texte))
         {
             Console.WriteLine("(rien entendu)");
+            return;
+        }
+
+        // Fermeture : on a demandé confirmation au tour précédent.
+        if (_fermetureEnAttente)
+        {
+            _fermetureEnAttente = false;
+            if (EstConfirmation(texte))
+            {
+                await Tts.Parler("D'accord, je me ferme. Au revoir.");
+                TuerCetAgent();
+                return;
+            }
+            await Tts.Parler("D'accord, je reste là.");
+            Demarrer();
+            return;
+        }
+
+        // « que fais-tu » -> statut local (fonctionne même quand je travaille).
+        if (EstStatut(texte))
+        {
+            await RapporterStatut();
+            Demarrer();
+            return;
+        }
+
+        // « tue le poulpe » -> demande confirmation avant de fermer.
+        if (EstFermeture(texte))
+        {
+            _fermetureEnAttente = true;
+            await Tts.Parler("Tu veux vraiment me fermer ? Dis oui pour confirmer.");
+            Demarrer();
+            return;
+        }
+
+        // Création d'agent : on a demandé un nom au tour précédent -> on le prend ici.
+        if (_nouvelAgentEnAttente)
+        {
+            _nouvelAgentEnAttente = false;
+            var nomAgent = NettoyerNom(texte);
+            if (nomAgent.Length == 0)
+            {
+                await Tts.Parler("Je n'ai pas compris le nom, j'annule.");
+                Demarrer();
+                return;
+            }
+            LancerNouvelAgent(nomAgent);
+            await Tts.Parler($"Nouvel agent {nomAgent} créé.");
+            Demarrer();
+            return;
+        }
+
+        // « nouvel agent » -> on demande son nom, puis on le crée au tour suivant.
+        if (EstNouvelAgent(texte))
+        {
+            _nouvelAgentEnAttente = true;
+            await Tts.Parler("Quel nom pour le nouvel agent ?");
+            Demarrer();
             return;
         }
 
@@ -464,6 +669,16 @@ class Program
             }
             Console.WriteLine("[↻] Redémarrage annulé.");
             await Tts.Parler("D'accord, j'annule le redémarrage.");
+            Demarrer();                                 // on continue à écouter
+            return;
+        }
+
+        if (EstHistorique(texte, out int nHist))
+        {
+            int affiches = AfficherHistorique(nHist);
+            await Tts.Parler(affiches > 0
+                ? $"Voici les {affiches} derniers messages dans la console."
+                : "L'historique est vide pour l'instant.");
             Demarrer();                                 // on continue à écouter
             return;
         }
@@ -508,6 +723,126 @@ class Program
         var mot = MotSeul(t);
         return mot is "restart" or "restarte" or "ristart" or "reboot" or "rebuild"
             or "redemarre" or "redemarrer" or "redemarrage";
+    }
+
+    // Vrai si la phrase est la commande « historique [N] ». N par défaut = 10.
+    static bool EstHistorique(string t, out int n)
+    {
+        n = 10;
+        var tokens = t.Split(new[] { ' ', '\t', ',', '.' }, StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length == 0) return false;
+        if (MotSeul(tokens[0]) is not ("historique" or "history" or "historic")) return false;
+
+        var chiffres = new string(t.Where(char.IsDigit).ToArray());
+        if (chiffres.Length > 0 && int.TryParse(chiffres, out var k) && k > 0)
+            n = Math.Min(k, 50);
+        return true;
+    }
+
+    // Réaffiche les N derniers messages (toi + Claude) en bulles. Renvoie le nombre affiché.
+    static int AfficherHistorique(int n)
+    {
+        List<(string qui, string texte)> snap;
+        lock (_histVerrou)
+            snap = _historique.Skip(Math.Max(0, _historique.Count - n)).ToList();
+
+        Overlay.Historique(snap);
+        return snap.Count;
+    }
+
+    // ── Création d'un nouvel agent (nouveau poulpe = nouvelle instance) ────────
+    static volatile bool _nouvelAgentEnAttente;        // on attend que tu dises le nom
+
+    static readonly string[] _nomsAuto =
+        { "claude", "jarvis", "alexa", "friday", "cortana", "samantha", "tars", "edith" };
+
+    static string NomAuto(int i) => i >= 0 && i < _nomsAuto.Length ? _nomsAuto[i] : "agent" + i;
+
+    // Vrai si la phrase demande la création d'un nouvel agent.
+    static bool EstNouvelAgent(string t)
+    {
+        var s = MotSeul(t);
+        return s.Contains("nouvelagent") || s.Contains("nouveauagent")
+            || s.Contains("nouveaupoulpe") || s.Contains("creeunagent")
+            || s.Contains("creerunagent") || s.Contains("ajouteunagent")
+            || s.Contains("nouvelagent");
+    }
+
+    // Garde 1 à 2 mots comme nom d'agent (minuscule, sans ponctuation).
+    static string NettoyerNom(string t)
+    {
+        var mots = t.Split(new[] { ' ', '\t', '.', ',', '!', '?' }, StringSplitOptions.RemoveEmptyEntries);
+        return string.Join(" ", mots.Take(2)).ToLowerInvariant().Trim();
+    }
+
+    // Dernières tâches connues (pour la commande « que fais-tu »).
+    static volatile List<(string contenu, string statut)> _taches = new();
+
+    // ── Statut : « que fais-tu », répondu localement (marche même occupé) ──────
+    static bool EstStatut(string t)
+    {
+        var s = MotSeul(t);
+        return s.Contains("quefaistu") || s.Contains("tufaisquoi")
+            || s.Contains("tuenesou") || s == "statut" || s == "status";
+    }
+
+    static async Task RapporterStatut()
+    {
+        var taches = _taches;
+        var enCours = taches.FirstOrDefault(x => x.statut == "in_progress");
+        string phrase;
+        if (_occupe)
+            phrase = enCours.contenu is { Length: > 0 }
+                ? $"Je travaille sur : {enCours.contenu}."
+                : "Je suis en train de travailler.";
+        else
+        {
+            int reste = taches.Count(x => x.statut != "completed");
+            phrase = reste > 0
+                ? $"Je suis inactif. Il reste {reste} tâche{(reste > 1 ? "s" : "")}."
+                : "Je suis inactif, rien en cours.";
+        }
+        await Tts.Parler(phrase);
+    }
+
+    // ── Fermeture de cet agent (« tue le poulpe ») ────────────────────────────
+    static volatile bool _fermetureEnAttente;          // on attend la confirmation
+
+    static bool EstFermeture(string t)
+    {
+        var s = MotSeul(t);
+        return s.Contains("tuelepoulpe") || s.Contains("tuetoi") || s.Contains("fermelagent")
+            || s.Contains("fermetoi") || s.Contains("arretetoi") || s.Contains("supprimelagent")
+            || s.Contains("tuelagent");
+    }
+
+    // Arrête le modèle de cet agent et ferme son poulpe (= ferme ce process).
+    public static void TuerCetAgent()
+    {
+        _arretDemande = true;
+        Salon.Retirer();
+        try { _claude?.StandardInput.Close(); } catch { }
+        try { _claude?.Kill(true); } catch { }
+        Environment.Exit(0);
+    }
+
+    // Lance une nouvelle instance (un nouvel agent/poulpe) avec son propre nom.
+    public static void LancerNouvelAgent(string? nom)
+    {
+        int n = Process.GetProcessesByName("ClaudeVocal").Length;   // instances déjà vivantes
+        string vrai = string.IsNullOrWhiteSpace(nom) ? NomAuto(n) : nom.Trim().ToLowerInvariant();
+        string exe = Environment.ProcessPath ?? "";
+        if (exe.Length == 0) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = $"--nom \"{vrai}\" --index {n}",
+                UseShellExecute = true
+            });
+        }
+        catch { /* tant pis */ }
     }
 
     // Recompile le projet, ferme l'appli courante et relance la nouvelle.
@@ -565,6 +900,7 @@ class Program
 
         // On se ferme proprement ; le .bat prendra le relais une fois l'exe libéré.
         _arretDemande = true;
+        Salon.Retirer();
         try { _claude?.StandardInput.Close(); _claude?.Kill(true); } catch { }
         Environment.Exit(0);
     }
@@ -635,6 +971,6 @@ class Program
             finally { _enTrainDeParler = false; }
         }
 
-        public static Task Parler(string texte) => VoixNaturelle.Lire(texte);
+        public static Task Parler(string texte) => Salon.Parler(() => VoixNaturelle.Lire(texte));
     }
 }
