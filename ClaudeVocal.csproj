@@ -13,6 +13,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Overlay graphique (poulpe + bulles de conversation) -->
+    <PackageReference Include="Avalonia" Version="11.2.1" />
+    <PackageReference Include="Avalonia.Desktop" Version="11.2.1" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="11.2.1" />
     <!-- Mot-clé + synthèse vocale de repli -->
     <PackageReference Include="System.Speech" Version="8.0.0" />
     <!-- Capture micro -->

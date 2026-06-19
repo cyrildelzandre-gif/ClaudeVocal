@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Speech.Recognition;
 using System.Text;
 using System.Text.Json;
+using Avalonia;
 
 // ───────────────────────────────────────────────────────────────────────────
 //  Claude Vocal — conversation orale avec Claude Code.
@@ -43,11 +44,23 @@ class Program
 
     static readonly CultureInfo Fr = new("fr-FR");
 
-    static async Task Main()
+    [STAThread]
+    static void Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
         Console.WriteLine("=== Claude Vocal ===");
+        // Avalonia prend le thread principal ; le vocal démarre quand l'UI est prête.
+        BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+    }
 
+    public static AppBuilder BuildAvaloniaApp()
+        => AppBuilder.Configure<OverlayApp>().UsePlatformDetect().LogToTrace();
+
+    // Appelé par l'overlay une fois la fenêtre affichée.
+    public static void DemarrerVocal() => _ = Task.Run(BoucleVocale);
+
+    static async Task BoucleVocale()
+    {
         if (!LancerClaude())
             return;
 
@@ -95,6 +108,7 @@ class Program
         reco.RecognizeAsyncStop();
         _arretDemande = true;
         try { _claude?.StandardInput.Close(); _claude?.Kill(true); } catch { }
+        Environment.Exit(0);
     }
 
     // ── Lancement du process claude persistant (streaming JSON) ───────────────
@@ -174,6 +188,7 @@ class Program
                             if (phrase.Length == 0 || phrase == _dernierDit) continue;
                             _dernierDit = phrase;
                             Console.WriteLine("\nClaude : " + phrase + "\n");
+                            Overlay.Claude(phrase);
                             await Tts.ParlerProtege(phrase);
                         }
                     }
@@ -190,9 +205,11 @@ class Program
                     if (reponse.Length > 0 && reponse != _dernierDit)
                     {
                         Console.WriteLine("\nClaude : " + reponse + "\n");
+                        Overlay.Claude(reponse);
                         await Tts.ParlerProtege(reponse);
                     }
                     _dernierDit = "";
+                    Overlay.Travail(false);           // Claude attend ta réponse -> rond vert
                     Demarrer();                       // conversation continue : on réécoute
                 }
             }
@@ -237,6 +254,8 @@ class Program
         }
 
         Console.WriteLine("Vous : " + question);
+        Overlay.Vous(question);
+        Overlay.Travail(true);                 // Claude se met au travail -> rond rouge
 
         // Message au format attendu par claude (stream-json input).
         var msg = new
@@ -267,7 +286,7 @@ class Program
     static readonly string[] MotsCmd = { "claude", "annuler", "annule" };
 
     // Seuils réglables.
-    const float ConfDemarrage   = 0.45f;   // confiance pour DÉMARRER l'écoute
+    const float ConfDemarrage   = 0.65f;   // confiance pour DÉMARRER l'écoute (plus strict = moins de faux déclenchements)
     const float ConfAnnule      = 0.65f;   // confiance pour ANNULER (strict)
     const int   AntiRebondMs    = 700;
     const int   SilenceFinMs    = 2000;    // pause (ms) qui déclenche l'envoi
@@ -311,6 +330,7 @@ class Program
             DemarrerBoucle();
             Console.WriteLine("\n[●] Écoute... parle librement, fais une PAUSE pour envoyer (« annule » pour abandonner).");
         }
+        Overlay.Etat(true);
         Bip(true);
     }
 
@@ -358,6 +378,7 @@ class Program
 
         ArreterBoucle();
         Micro.Arreter();
+        Overlay.Etat(false);
         Console.WriteLine("\n[zzz] En veille — dis « claude » pour reprendre.");
     }
 
@@ -430,7 +451,135 @@ class Program
             Console.WriteLine("(rien entendu)");
             return;
         }
+
+        // Redémarrage : un « restart » demande d'abord confirmation, et c'est
+        // seulement au tour suivant, si on dit « oui », qu'on recompile/relance.
+        if (_redemarrageEnAttente)
+        {
+            _redemarrageEnAttente = false;
+            if (EstConfirmation(texte))
+            {
+                await Redemarrer();
+                return;
+            }
+            Console.WriteLine("[↻] Redémarrage annulé.");
+            await Tts.Parler("D'accord, j'annule le redémarrage.");
+            Demarrer();                                 // on continue à écouter
+            return;
+        }
+
+        if (EstRedemarrage(texte))
+        {
+            _redemarrageEnAttente = true;
+            Console.WriteLine("[↻] Confirmer le redémarrage ? Dis « oui ».");
+            await Tts.Parler("Tu veux vraiment recompiler et redémarrer ? Dis oui pour confirmer.");
+            Demarrer();                                 // on réécoute pour la confirmation
+            return;
+        }
+
         await EnvoyerAClaude(texte);
+    }
+
+    static volatile bool _redemarrageEnAttente;         // un « restart » attend confirmation
+
+    // Vrai si la phrase est une confirmation (« oui », « confirme »...).
+    static bool EstConfirmation(string t)
+    {
+        var mot = MotSeul(t);
+        return mot is "oui" or "ouais" or "oui" or "ok" or "oke" or "okay"
+            or "confirme" or "confirmer" or "vasy" or "go" or "daccord"
+            or "restart" or "redemarre" or "redemarrer";
+    }
+
+    // Normalise une phrase courte en un mot : lettres seules, minuscules, sans accents.
+    static string MotSeul(string t)
+    {
+        var mot = new string(t.Where(char.IsLetter).ToArray())
+            .ToLowerInvariant()
+            .Normalize(NormalizationForm.FormD);
+        return new string(mot
+            .Where(c => CharUnicodeInfo.GetUnicodeCategory(c) != UnicodeCategory.NonSpacingMark)
+            .ToArray());
+    }
+
+    // Vrai si la phrase dictée est uniquement le mot-clé de redémarrage.
+    static bool EstRedemarrage(string t)
+    {
+        var mot = MotSeul(t);
+        return mot is "restart" or "restarte" or "ristart" or "reboot" or "rebuild"
+            or "redemarre" or "redemarrer" or "redemarrage";
+    }
+
+    // Recompile le projet, ferme l'appli courante et relance la nouvelle.
+    // L'exe étant verrouillé tant qu'on tourne, on délègue à un .bat qui :
+    //   1) attend la fin de NOTRE process, 2) build, 3) relance le nouvel exe.
+    static async Task Redemarrer()
+    {
+        Console.WriteLine("\n[↻] Redémarrage : compilation puis relance.");
+        await Tts.Parler("Ok, je recompile et je redémarre.");
+
+        string? csproj = TrouverCsproj();
+        if (csproj is null)
+        {
+            Console.WriteLine("(X) Projet .csproj introuvable, redémarrage annulé.");
+            await Tts.Parler("Je ne trouve pas le projet, j'annule le redémarrage.");
+            return;
+        }
+
+        // On recompile DIRECTEMENT dans le dossier où tourne l'exe actuel (-o),
+        // pour relancer la version fraîche peu importe la config de build.
+        string exeDir = AppContext.BaseDirectory.TrimEnd('\\', '/');
+        string exe = Path.Combine(exeDir, "ClaudeVocal.exe");
+        int pid = Environment.ProcessId;
+
+        string script =
+            "@echo off\r\n" +
+            "chcp 65001 >nul\r\n" +
+            "echo Attente de la fermeture de l'application...\r\n" +
+            ":wait\r\n" +
+            $"tasklist /FI \"PID eq {pid}\" | find \"{pid}\" >nul\r\n" +
+            "if %errorlevel%==0 (\r\n" +
+            "  timeout /t 1 /nobreak >nul\r\n" +
+            "  goto wait\r\n" +
+            ")\r\n" +
+            "echo Compilation...\r\n" +
+            $"dotnet build \"{csproj}\" -c Debug -o \"{exeDir}\"\r\n" +
+            "if errorlevel 1 (\r\n" +
+            "  echo *** BUILD ECHOUE - l'application n'a pas ete relancee. ***\r\n" +
+            "  pause\r\n" +
+            "  goto fin\r\n" +
+            ")\r\n" +
+            "echo Relance...\r\n" +
+            $"start \"ClaudeVocal\" \"{exe}\"\r\n" +
+            ":fin\r\n" +
+            "del \"%~f0\"\r\n";
+
+        string bat = Path.Combine(Path.GetTempPath(), "claudevocal_restart.bat");
+        await File.WriteAllTextAsync(bat, script, new UTF8Encoding(false));
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = bat,
+            UseShellExecute = true,        // fenêtre visible : on suit la compilation
+        });
+
+        // On se ferme proprement ; le .bat prendra le relais une fois l'exe libéré.
+        _arretDemande = true;
+        try { _claude?.StandardInput.Close(); _claude?.Kill(true); } catch { }
+        Environment.Exit(0);
+    }
+
+    // Remonte depuis le dossier de l'exe jusqu'à trouver le .csproj du projet.
+    static string? TrouverCsproj()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            var f = dir.GetFiles("*.csproj");
+            if (f.Length > 0) return f[0].FullName;
+            dir = dir.Parent;
+        }
+        return null;
     }
 
     // Retire les mots de commande (« claude », « annule »...) en début/fin de phrase.
