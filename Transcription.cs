@@ -18,10 +18,18 @@ static class Micro
     static List<byte> _buf = new();      // PCM 16 kHz mono 16 bits accumulé
 
     // Détection voix/silence (VAD) pour la fin de phrase automatique.
+    // Seuil ADAPTATIF : on estime le bruit de fond en continu et on considère
+    // qu'il y a voix quand l'énergie dépasse nettement ce bruit. Ça évite de
+    // régler un seuil fixe à la main et ça résiste à un micro bruyant.
     static readonly Stopwatch _chrono = new();
     static long _dernierSonMs;
     static volatile bool _aParle;
-    const double SeuilVoix = 550;        // RMS au-dessus = voix (à ajuster selon le micro)
+    static double _bruitFond;            // estimation lissée du bruit ambiant (RMS)
+    static int _framesVoix;              // frames voisées consécutives (anti-pic)
+
+    const double SeuilPlancher = 180;    // plancher : en dessous, jamais considéré comme voix
+    const double MargeVoix     = 3.0;    // voix = bruitFond × cette marge
+    const int    FramesMiniVoix = 2;     // ~160 ms de voix continue pour valider (anti-pic bref)
 
     // Atténuation du volume des sorties audio pendant la saisie (anti-parasites).
     static MMDevice? _sortie;
@@ -37,6 +45,8 @@ static class Micro
         lock (_lock) _buf = new List<byte>(1 << 20);
         _aParle = false;
         _dernierSonMs = 0;
+        _bruitFond = 0;                   // recalibrage du bruit à chaque écoute
+        _framesVoix = 0;
         _chrono.Restart();
         _in = new WaveInEvent { WaveFormat = Format, BufferMilliseconds = 80 };
         _in.DataAvailable += (_, e) =>
@@ -50,7 +60,8 @@ static class Micro
         catch (Exception ex) { Console.WriteLine("(X) Micro (capture) : " + ex.Message); }
     }
 
-    // Mesure l'énergie (RMS) du chunk pour détecter voix vs silence.
+    // Mesure l'énergie (RMS) du chunk et décide voix vs silence par rapport au
+    // bruit de fond estimé. Le seuil s'adapte tout seul au micro et à la pièce.
     static void AnalyserVolume(byte[] buf, int octets)
     {
         int n = octets / 2;
@@ -62,10 +73,24 @@ static class Micro
             somme += (double)v * v;
         }
         double rms = Math.Sqrt(somme / n);
-        if (rms >= SeuilVoix)
+
+        // Seuil dynamique : nettement au-dessus du bruit ambiant, jamais sous le plancher.
+        double seuil = Math.Max(SeuilPlancher, _bruitFond * MargeVoix);
+
+        if (rms >= seuil)
         {
-            _aParle = true;
-            _dernierSonMs = _chrono.ElapsedMilliseconds;
+            // Il faut quelques frames voisées d'affilée pour valider (filtre les pics brefs).
+            if (++_framesVoix >= FramesMiniVoix)
+            {
+                _aParle = true;
+                _dernierSonMs = _chrono.ElapsedMilliseconds;
+            }
+        }
+        else
+        {
+            _framesVoix = 0;
+            // Pendant le silence, on apprend le niveau de bruit (lissage lent).
+            _bruitFond = _bruitFond <= 0 ? rms : _bruitFond * 0.97 + rms * 0.03;
         }
     }
 

@@ -361,3 +361,7 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Modèles Whisper (volumineux, téléchargés au 1er lancement)
+*.bin
+*.bin.part

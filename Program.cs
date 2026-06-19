@@ -28,11 +28,18 @@ class Program
     static readonly Stopwatch _depuisBascule = Stopwatch.StartNew();
 
     static Process? _claude;                          // le process claude persistant
+    static string _dernierDit = "";                   // dernière phrase déjà lue (anti-doublon)
 
-    // Consigne « résumé oral », envoyée avec chaque question.
+    // Consigne « conversation orale », envoyée avec chaque question.
     const string Consigne =
-        "[Réponds en français, à l'oral, en 2 phrases maximum, comme dans une conversation " +
-        "parlée. Pas de listes, pas de code, pas de markdown : juste un résumé clair.]";
+        "[Conversation VOCALE en français. Tu peux utiliser tes outils (lire des fichiers, " +
+        "lancer des commandes, etc.) si c'est utile. " +
+        "RÉACTIVITÉ : si la demande implique du travail (outils, fichiers, commandes), commence " +
+        "TOUJOURS par une courte phrase parlée disant ce que tu vas faire (ex : « Ok, je vais " +
+        "regarder le fichier X. ») AVANT d'utiliser le moindre outil. Puis fais le travail, et " +
+        "termine par une phrase de conclusion brève. " +
+        "Chaque phrase parlée doit être COURTE, naturelle, sans listes, sans code, sans markdown. " +
+        "Pose une question si tu as besoin d'une précision.]";
 
     static readonly CultureInfo Fr = new("fr-FR");
 
@@ -86,6 +93,7 @@ class Program
         Console.ReadLine();
 
         reco.RecognizeAsyncStop();
+        _arretDemande = true;
         try { _claude?.StandardInput.Close(); _claude?.Kill(true); } catch { }
     }
 
@@ -149,15 +157,42 @@ class Program
 
                 var type = root.TryGetProperty("type", out var t) ? t.GetString() : null;
 
-                // Événement final d'un tour : contient la réponse complète.
-                if (type == "result" &&
-                    root.TryGetProperty("result", out var r) &&
-                    r.ValueKind == JsonValueKind.String)
+                // Messages de l'assistant AU FIL DE L'EAU : on lit à voix haute chaque
+                // bloc de texte dès qu'il arrive (ex : « Ok, je vais regarder X »), pour
+                // répondre AVANT/PENDANT le travail au lieu d'attendre la fin.
+                if (type == "assistant" &&
+                    root.TryGetProperty("message", out var m) &&
+                    m.TryGetProperty("content", out var contenu) &&
+                    contenu.ValueKind == JsonValueKind.Array)
                 {
-                    var reponse = (r.GetString() ?? "").Trim();
-                    if (reponse.Length == 0) continue;
-                    Console.WriteLine("\nClaude : " + reponse + "\n");
-                    await Tts.ParlerProtege(reponse);
+                    foreach (var bloc in contenu.EnumerateArray())
+                    {
+                        if (bloc.TryGetProperty("type", out var bt) && bt.GetString() == "text" &&
+                            bloc.TryGetProperty("text", out var tx))
+                        {
+                            var phrase = (tx.GetString() ?? "").Trim();
+                            if (phrase.Length == 0 || phrase == _dernierDit) continue;
+                            _dernierDit = phrase;
+                            Console.WriteLine("\nClaude : " + phrase + "\n");
+                            await Tts.ParlerProtege(phrase);
+                        }
+                    }
+                    continue;
+                }
+
+                // Événement final d'un tour : on a déjà parlé en streaming ; on ne
+                // relit que si rien n'a encore été dit, puis on réécoute.
+                if (type == "result")
+                {
+                    var reponse = root.TryGetProperty("result", out var r) &&
+                                  r.ValueKind == JsonValueKind.String
+                                  ? (r.GetString() ?? "").Trim() : "";
+                    if (reponse.Length > 0 && reponse != _dernierDit)
+                    {
+                        Console.WriteLine("\nClaude : " + reponse + "\n");
+                        await Tts.ParlerProtege(reponse);
+                    }
+                    _dernierDit = "";
                     Demarrer();                       // conversation continue : on réécoute
                 }
             }
@@ -167,6 +202,28 @@ class Program
         {
             Console.WriteLine("(X) Lecture claude : " + ex.Message);
         }
+
+        // Le process est mort (crash, déconnexion...) -> on le relance tout seul
+        // pour que la conversation vocale puisse reprendre sans redémarrer l'appli.
+        if (!_arretDemande)
+            Relancer();
+    }
+
+    static volatile bool _arretDemande;        // vrai quand l'utilisateur quitte volontairement
+
+    // Relance le process claude après une coupure imprévue (avec petit délai).
+    static void Relancer()
+    {
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(1500);
+            if (_arretDemande) return;
+            Console.WriteLine("(↻) Redémarrage du process claude...");
+            if (LancerClaude())
+                await Tts.Parler("Je suis de retour.");
+            else
+                await Tts.Parler("Le moteur Claude ne répond plus.");
+        });
     }
 
     // ── Injection d'une question dans le process claude ───────────────────────
