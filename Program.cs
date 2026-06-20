@@ -109,6 +109,10 @@ class Program
             else if (args[i] == "--index" && int.TryParse(args[i + 1], out var ix)) _index = ix;
         }
 
+        // Le mot de réveil à retirer des phrases = le nom de CE profil
+        // (« claude » pour Claude, « jarvis » pour Jarvis...).
+        MotsCmd = new[] { _nom, "annuler", "annule" };
+
         _dossierMemoire = DossierMemoire();             // mémoire persistante de CE profil
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Salon.Retirer();   // sortie propre du registre
 
@@ -168,7 +172,7 @@ class Program
         reco.RecognizeAsync(RecognizeMode.Multiple);
         _reco = reco;                                  // évite le ramasse-miettes
 
-        DemarrerRappelInactif();                        // rappels « je suis inactif » toutes les 30 s
+        DemarrerRappelInactif();                        // rappels « je suis inactif » toutes les 5 min
 
         await BriefingDemarrage();                       // Claude apprend qu'il parle en vocal + se présente
 
@@ -186,7 +190,7 @@ class Program
         {
             while (!_arretDemande)
             {
-                try { await Task.Delay(30000); } catch { break; }
+                try { await Task.Delay(300000); } catch { break; }
                 if (_occupe || _enTrainDeParler) continue;          // occupé ou déjà en train de parler
                 if (Salon.OccupeAilleurs()) continue;               // un autre agent est en conversation
                 if (_etat == Etat.Ecoute && Micro.AParle) continue; // tu es en train de dicter
@@ -298,7 +302,7 @@ class Program
                 }
 
                 // Événement final d'un tour : on a déjà parlé en streaming ; on ne
-                // relit que si rien n'a encore été dit, puis on réécoute.
+                // relit que si rien n'a encore été dit, puis on repasse en veille.
                 if (type == "result")
                 {
                     var reponse = root.TryGetProperty("result", out var r) &&
@@ -314,7 +318,11 @@ class Program
                     _dernierDit = "";
                     _occupe = false;
                     Overlay.Travail(false);           // Claude attend ta réponse -> rond vert
-                    Demarrer();                       // conversation continue : on réécoute
+                    // On NE réécoute PAS tout seul : retour en veille, il faut
+                    // redire « claude » pour relancer l'enregistrement.
+                    PublierEtat("repos");
+                    Overlay.Etat(false);
+                    Console.WriteLine("\n[zzz] En veille — dis « claude » pour reprendre.");
                 }
             }
             Console.WriteLine("(!) Le process claude s'est arrêté.");
@@ -425,7 +433,7 @@ class Program
     // ── Reconnaissance ────────────────────────────────────────────────────────
     static CancellationTokenSource? _liveCts;          // boucle écoute/live
     static volatile bool _liveEnCours;                 // une transcription live à la fois
-    static readonly string[] MotsCmd = { "claude", "annuler", "annule" };
+    static string[] MotsCmd = { "claude", "annuler", "annule" };  // mis à jour selon _nom
 
     // Seuils réglables.
     const float ConfDemarrage   = 0.65f;   // confiance pour DÉMARRER l'écoute (plus strict = moins de faux déclenchements)
