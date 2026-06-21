@@ -153,7 +153,7 @@ class Program
         // Deux grammaires : le mot-clé « claude » (bascule) et « annule » (abandon).
         // La dictée elle-même passe par Whisper (streaming).
         var cult = reco.RecognizerInfo.Culture;
-        var motCle = new Grammar(new GrammarBuilder(_nom) { Culture = cult }) { Name = "wake" };
+        var motCle = new Grammar(ConstruireReveil(_nom, cult)) { Name = "wake" };
         var annulerG = new Grammar(new GrammarBuilder(new Choices("annule", "annuler")) { Culture = cult })
         {
             Name = "cancel"
@@ -178,6 +178,25 @@ class Program
 
         // Plus de console : la fenêtre du poulpe gère la durée de vie de l'appli.
         await Task.Delay(System.Threading.Timeout.Infinite);
+    }
+
+    // Variantes phonétiques françaises du mot de réveil. Le moteur vocal FR reconnaît
+    // mal un prénom anglais brut (ex. « jarvis ») : on lui propose, EN PLUS du nom,
+    // des orthographes françaises qui sonnent pareil, ce qui débloque la détection.
+    static GrammarBuilder ConstruireReveil(string nom, System.Globalization.CultureInfo cult)
+    {
+        var v = new List<string> { nom };
+        switch (nom)
+        {
+            case "jarvis":   v.AddRange(new[] { "jarvisse", "djarvis", "djarvisse", "jarviss" }); break;
+            case "friday":   v.AddRange(new[] { "fraïday", "fraïdé", "frydé" }); break;
+            case "cortana":  v.AddRange(new[] { "cortanna", "kortana", "cortanah" }); break;
+            case "samantha": v.AddRange(new[] { "samanta", "samentha" }); break;
+            case "alexa":    v.AddRange(new[] { "alexah", "alèxa", "aleksa" }); break;
+            case "edith":    v.AddRange(new[] { "édith", "édit", "idith" }); break;
+            case "tars":     v.AddRange(new[] { "tarss", "tarce", "tarsse" }); break;
+        }
+        return new GrammarBuilder(new Choices(v.ToArray())) { Culture = cult };
     }
 
     static SpeechRecognitionEngine? _reco;             // gardé en vie tant que l'appli tourne
